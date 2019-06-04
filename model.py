@@ -33,23 +33,34 @@ from tensorflow.keras.layers import Concatenate
 from tensorflow.keras.layers import Add
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.layers import DepthwiseConv2D
+from tensorflow.keras.layers import Conv2D as OriginalConv2D
+from tensorflow.keras.layers import DepthwiseConv2D as OriginalDepthwiseConv2D
 from tensorflow.keras.layers import ZeroPadding2D
 from tensorflow.keras.layers import AveragePooling2D
 from tensorflow.keras.layers import GlobalAveragePooling2D
 from tensorflow.keras.layers import Layer
 from tensorflow.keras.layers import InputSpec
+from tensorflow.keras.regularizers import l2
 from tensorflow.python.keras.utils.layer_utils import get_source_inputs
 from tensorflow.python.keras.applications.imagenet_utils import preprocess_input
 from tensorflow.python.keras.utils import conv_utils
 from tensorflow.python.keras.utils.data_utils import get_file
+from tensorflow.python.framework import ops
 
 WEIGHTS_PATH_X = "https://github.com/bonlime/keras-deeplab-v3-plus/releases/download/1.1/deeplabv3_xception_tf_dim_ordering_tf_kernels.h5"
 WEIGHTS_PATH_MOBILE = "https://github.com/bonlime/keras-deeplab-v3-plus/releases/download/1.1/deeplabv3_mobilenetv2_tf_dim_ordering_tf_kernels.h5"
 WEIGHTS_PATH_X_CS = "https://github.com/bonlime/keras-deeplab-v3-plus/releases/download/1.2/deeplabv3_xception_tf_dim_ordering_tf_kernels_cityscapes.h5"
 WEIGHTS_PATH_MOBILE_CS = "https://github.com/bonlime/keras-deeplab-v3-plus/releases/download/1.2/deeplabv3_mobilenetv2_tf_dim_ordering_tf_kernels_cityscapes.h5"
                          
+
+def Conv2D(*args, **kwargs):
+    return OriginalConv2D(*args, **kwargs, kernel_regularizer=l2(0.0001))
+
+
+def DepthwiseConv2D(*args, **kwargs):
+    return OriginalDepthwiseConv2D(*args, **kwargs, kernel_regularizer=l2(0.0001))
+
+
 def SepConv_BN(x, filters, prefix, stride=1, kernel_size=3, rate=1, depth_activation=False, epsilon=1e-3):
     """ SepConv with BN between depthwise & pointwise. Optionally add activation after BN
         Implements right "same" padding for even kernel sizes
@@ -150,9 +161,9 @@ def _xception_block(inputs, depth_list, prefix, skip_connection_type, stride,
                                 kernel_size=1,
                                 stride=stride)
         shortcut = BatchNormalization(name=prefix + '_shortcut_BN')(shortcut)
-        outputs = layers.add([residual, shortcut])
+        outputs = Add()([residual, shortcut])
     elif skip_connection_type == 'sum':
-        outputs = layers.add([residual, inputs])
+        outputs = Add()([residual, inputs])
     elif skip_connection_type == 'none':
         outputs = residual
     if return_skip:
@@ -162,7 +173,7 @@ def _xception_block(inputs, depth_list, prefix, skip_connection_type, stride,
 
 
 def relu6(x):
-    return tf.keras.activations.relu(x, max_value=6)
+    return Lambda(lambda x_: tf.keras.activations.relu(x_, max_value=6))(x)
 
 
 def _make_divisible(v, divisor, min_value=None):
@@ -176,7 +187,7 @@ def _make_divisible(v, divisor, min_value=None):
 
 
 def _inverted_res_block(inputs, expansion, stride, alpha, filters, block_id, skip_connection, rate=1):
-    in_channels =  inputs.shape[-1] #inputs._keras_shape[-1]
+    in_channels = inputs.shape[-1] #inputs._keras_shape[-1]
     pointwise_conv_filters = int(filters * alpha)
     pointwise_filters = _make_divisible(pointwise_conv_filters, 8)
     x = inputs
@@ -371,16 +382,26 @@ def Deeplabv3(weights='pascal_voc', input_tensor=None, input_shape=(512, 512, 3)
     # branching for Atrous Spatial Pyramid Pooling
 
     # Image Feature branch
-    shape_before = tf.shape(x)
     b4 = GlobalAveragePooling2D()(x)
-    b4 = tf.expand_dims(tf.expand_dims(b4, 1),1) # from (b_size, channels)->(b_size, 1, 1, channels)
+    b4 = Lambda(lambda x: tf.expand_dims(tf.expand_dims(x, 1),1))(b4) # from (b_size, channels)->(b_size, 1, 1, channels)
     b4 = Conv2D(256, (1, 1), padding='same',
                 use_bias=False, name='image_pooling')(b4)
     b4 = BatchNormalization(name='image_pooling_BN', epsilon=1e-5)(b4)
     b4 = Activation('relu')(b4)
     #upsample. have to use compat because of the option align_corners
-    b4 = Lambda(lambda x: tf.compat.v1.image.resize(x, shape_before[1:3], 
-                                                    method='bilinear',align_corners=True))(b4) 
+    # if ops.executing_eagerly_outside_functions():
+    #     #relevant_shape = x.get_shape().as_list()[1:3]  # shape_before[1:3]
+    #     b4 = Lambda(lambda x: tf.compat.v1.image.resize(x, relevant_shape,
+    #                                                     method='bilinear',align_corners=True))(b4)
+    # else:
+    if backbone == 'xception':
+        b4 = Lambda(lambda x: tf.compat.v1.image.resize(x, [int(input_shape[0] / 16), int(input_shape[1] / 16)],
+                                                        method='bilinear', align_corners=True))(b4)
+        b4 = layers.Reshape([int(input_shape[0] / 16), int(input_shape[1] / 16), 256])(b4)
+    else:
+        b4 = Lambda(lambda x: tf.compat.v1.image.resize(x, [int(input_shape[0] / 8), int(input_shape[1] / 8)],
+                                                        method='bilinear',align_corners=True))(b4)
+        b4 = layers.Reshape([int(input_shape[0] / 8), int(input_shape[1] / 8), 256])(b4)
 
     # simple 1x1
     b0 = Conv2D(256, (1, 1), padding='same', use_bias=False, name='aspp0')(x)
@@ -400,9 +421,9 @@ def Deeplabv3(weights='pascal_voc', input_tensor=None, input_shape=(512, 512, 3)
                         rate=atrous_rates[2], depth_activation=True, epsilon=1e-5)
 
         # concatenate ASPP branches & project
-        x = Concatenate()([b4, b0, b1, b2, b3])
+        x = Concatenate(name='problematic_concat_xc')([b4, b0, b1, b2, b3])
     else:
-        x = Concatenate()([b4, b0])
+        x = Concatenate(name='problematic_concat_mb')([b4, b0])  # TODO This is wrong
 
     x = Conv2D(256, (1, 1), padding='same',
                use_bias=False, name='concat_projection')(x)
@@ -415,14 +436,15 @@ def Deeplabv3(weights='pascal_voc', input_tensor=None, input_shape=(512, 512, 3)
         # Feature projection
         # x4 (x2) block
         x = Lambda(lambda xx: tf.compat.v1.image.resize(xx,
-                                                x.shape[1:3]*tf.constant(OS//4),
+                                                # x.shape[1:3]*tf.constant(OS//4),
+                                                [OS//4 * int(input_shape[0] / 16), OS//4 * int(input_shape[1] / 16)],
                                                 method='bilinear', align_corners=True))(x) 
         dec_skip1 = Conv2D(48, (1, 1), padding='same',
                            use_bias=False, name='feature_projection0')(skip1)
         dec_skip1 = BatchNormalization(
             name='feature_projection0_BN', epsilon=1e-5)(dec_skip1)
         dec_skip1 = Activation('relu')(dec_skip1)
-        x = Concatenate()([x, dec_skip1])
+        x = Concatenate(name='is_this_it')([x, dec_skip1])
         x = SepConv_BN(x, 256, 'decoder_conv0',
                        depth_activation=True, epsilon=1e-5)
         x = SepConv_BN(x, 256, 'decoder_conv1',
@@ -435,9 +457,15 @@ def Deeplabv3(weights='pascal_voc', input_tensor=None, input_shape=(512, 512, 3)
         last_layer_name = 'custom_logits_semantic'
 
     x = Conv2D(classes, (1, 1), padding='same', name=last_layer_name)(x)
-    x = Lambda(lambda xx: tf.compat.v1.image.resize(xx,
-                                                   tf.shape(img_input)[1:3],
-                                                   method='bilinear',align_corners=True))(x) 
+    if ops.executing_eagerly_outside_functions():
+        relevant_shape = [int(input_shape[0]), int(input_shape[1])]
+        x = Lambda(lambda xx: tf.compat.v1.image.resize(xx,
+                                                       relevant_shape,
+                                                       method='bilinear',align_corners=True))(x)
+    else:
+        x = Lambda(lambda xx: tf.compat.v1.image.resize(xx,
+                                                       tf.shape(img_input)[1:3],
+                                                       method='bilinear',align_corners=True))(x)
 
     # Ensure that the model takes into account
     # any potential predecessors of `input_tensor`.
